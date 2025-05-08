@@ -1,0 +1,4 @@
+zig-out
+src/sensitive.zig
+.vscode
+.zig-cache
