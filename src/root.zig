@@ -27,16 +27,17 @@ const Session = struct {
 const Scrobble = struct {
     artist: []const u8,
     track: []const u8,
-    timestamp: u32,
-    album: ?[]const u8,
+    timestamp: i64,
+    album: ?[]const u8 = null,
     chosenByUser: bool = false,
-    trackNumber: ?u8,
-    duration: ?u32
+    trackNumber: ?u8 = null,
+    duration: ?u32 = null
 };
 
 const InvocationError = error {
     MissingToken,
     UnsupportedHTTPMethod,
+    NotAuthenticated
 };
 
 const HttpError = error {
@@ -90,7 +91,7 @@ const LastFMClient = struct {
 
         // Optionally sign the request
         if (options.sign_request) {
-            const signature = try self.generateSignature(&params);
+            const signature = try self.generateSignature(&my_params);
             try my_params.put("api_sig", &signature);
 
             if (options.logging) {
@@ -258,8 +259,6 @@ const LastFMClient = struct {
         const res = try self.invoke("auth.getSession", params, .{
             .response_body = &res_body,
             .as_json = true,
-            .logging = true,
-            // .hash_token = true,
             .sign_request = true
         });
 
@@ -295,15 +294,70 @@ const LastFMClient = struct {
         return self.session != null;
     }
 
-    // fn addScrobbleToParams(params: *QueryParameters, scrobble: Scrobble, index: ?usize) !void {
-    //     index = index orelse 0;
+    fn addScrobbleToParams(self: *LastFMClient, params: *QueryParameters, scrobble: Scrobble, index: ?u16) !void {
+        const i = index orelse 0;
         
-    // }
+        const helper = struct {
+            pub fn field(comptime T: type, comptime name: []const u8, value: ?T, qp: *QueryParameters, idx: u16, ally: std.mem.Allocator) !void {
+                if (value == null) {
+                    return;
+                }
 
-    // /// Scrobble a single track. Returns `true` if successful, `false` otherwise.
-    // pub fn scrobble(self: *LastFMClient) bool {
+                const key = try std.fmt.allocPrint(ally, name ++ "[{d}]", .{ idx });
+                defer ally.free(key);
+                const string_value: []const u8 = switch (T) {
+                    []const u8 => value.?,
+                    u8, u16, u32, i64 => try std.fmt.allocPrint(ally, "{d}", .{ value.? }),
+                    bool => if (value.?) "1" else "0",
+                    else => unreachable,
+                };
 
-    // }
+                try qp.put(key, string_value);
+
+                switch (T) {
+                    u8, u16, u32, i64 => {
+                        ally.free(string_value);
+                    },
+                    else => {}
+                }
+            }
+        };
+
+        try helper.field([]const u8, "artist", scrobble.artist, params, i, self.ally);
+        try helper.field([]const u8, "track", scrobble.track, params, i, self.ally);
+        try helper.field(i64, "timestamp", scrobble.timestamp, params, i, self.ally);
+        try helper.field([]const u8, "album", scrobble.album, params, i, self.ally);
+        try helper.field(bool, "chosenByUser", scrobble.chosenByUser, params, i, self.ally);
+        try helper.field(u8, "trackNumber", scrobble.trackNumber, params, i, self.ally);
+        try helper.field(u32, "duration", scrobble.duration, params, i, self.ally);
+    }
+
+    /// Scrobble a single track. Returns `true` if successful, `false` otherwise. Must be authenticated,
+    /// else this throws `InvocationError.NotAuthenticated`.
+    pub fn scrobbleOne(self: *LastFMClient, scrobble: Scrobble) !bool {
+        // Check if we're authenticated first
+        if (self.session == null) {
+            return InvocationError.NotAuthenticated;
+        }
+
+        // Build params
+        var params = QueryParameters.init(self.ally);
+        try self.addScrobbleToParams(&params, scrobble, 0);
+        try params.put("sk", &self.session.?.key);
+
+        // Invoke endpoint
+        var res_body = std.ArrayList(u8).init(self.ally);
+        defer res_body.deinit();
+        const res = try self.invoke("track.scrobble", params, . {
+            .sign_request = true,
+            .http_method = .POST,
+            .response_body = &res_body,
+            .logging = true
+        });
+
+        // TODO Check if error code is present + if track was ignored
+        return res.status == .ok;
+    }
 };
 
 /// Utility function to hash a string using MD5, returned as a string.
@@ -517,36 +571,37 @@ test "generate a valid API signature" {
     try testing.expect(std.mem.eql(u8, &generated_sig, &expected_sig));
 }
 
-// test "scrobble a single track" {
-//     // Create a LastFMClient
-//     const ally = testing.allocator;
+test "scrobble a single track" {
+    // Create a LastFMClient
+    const ally = testing.allocator;
 
-//     var http_client = http.Client{
-//         .allocator = ally
-//     };
+    var http_client = http.Client{
+        .allocator = ally
+    };
     
-//     var lastfm_client = LastFMClient{
-//         .api_key = "a" ** 32,
-//         .api_secret = "a" ** 32,
-//         .http_client = &http_client,
-//         .ally = ally
-//     };
-//     defer lastfm_client.http_client.*.deinit();
+    var lastfm_client = LastFMClient{
+        .api_key = sensitive.API_KEY,
+        .api_secret = sensitive.API_SECRET,
+        .http_client = &http_client,
+        .ally = ally
+    };
+    defer lastfm_client.http_client.*.deinit();
 
-//     // Ask for a token
-//     const token = try lastfm_client.getToken();
+    // Ask for a token
+    const token = try lastfm_client.getToken();
 
-//     // Prompt user to authorize the token
-//     const login_url = try lastfm_client.getLoginUrl(token);
-//     defer ally.free(login_url);
-//     std.debug.print("Please visit the following URL to allow this application to access your Last.fm account.\n{s}\n\nPress enter when you are finished.\n", .{ login_url });
-//     const stdin = std.io.getStdIn().reader();
-//     try stdin.skipUntilDelimiterOrEof('\n');
+    // Prompt user to authorize the token
+    const login_url = try lastfm_client.getLoginUrl(token);
+    defer ally.free(login_url);
+    std.debug.print("Please visit the following URL to allow this application to access your Last.fm account.\n{s}\n\nPress enter when you are finished.\n", .{ login_url });
+    const stdin = std.io.getStdIn().reader();
+    try stdin.skipUntilDelimiterOrEof('\n');
 
-//     // Exchange the token for a session
-//     const session = try lastfm_client.getSession(token);
-//     lastfm_client.useSession(session);
+    // Exchange the token for a session
+    const session = try lastfm_client.getSession(token);
+    lastfm_client.useSession(session);
 
-//     // Scrobble a dummy track
-    
-// }
+    // Scrobble a dummy track
+    const successful = try lastfm_client.scrobbleOne(.{ .artist = "SixBeeps", .track = "Visionario", .timestamp = @divFloor(std.time.milliTimestamp(), 1000) });
+    try testing.expect(successful);
+}

@@ -8,10 +8,12 @@ Zig library, interacts with the Last.fm API.
 
 ## Features + Todo
 - [x] Extendable and generic methods
-- [x] Authentication
+- [ ] Authentication
   - [x] Desktop / Web Flow
   - [ ] Mobile Flow
 - [ ] Scrobbling
+  - [x] Single Scrobble
+  - [ ] Batch Scrobble
 
 ## Usage
 ```zig
