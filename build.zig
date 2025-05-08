@@ -30,7 +30,7 @@ pub fn build(b: *std.Build) void {
     // for actually invoking the compiler.
     const lib = b.addLibrary(.{
         .linkage = .static,
-        .name = "zig_lastfm",
+        .name = "lastfm",
         .root_module = lib_mod,
     });
 
