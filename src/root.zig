@@ -24,6 +24,16 @@ const Session = struct {
     pub fn subscribed(self: Session) bool { return self.subscriber == @as(u1, 1); }
 };
 
+const Scrobble = struct {
+    artist: []const u8,
+    track: []const u8,
+    timestamp: u32,
+    album: ?[]const u8,
+    chosenByUser: bool = false,
+    trackNumber: ?u8,
+    duration: ?u32
+};
+
 const InvocationError = error {
     MissingToken,
     UnsupportedHTTPMethod,
@@ -37,15 +47,17 @@ const QueryParameters = std.StringHashMap([]const u8);
 
 /// A client for interacting with Last.fm's API.
 const LastFMClient = struct {
+    ally: std.mem.Allocator,
     api_key: *const [32:0]u8,
     api_secret: *const [32:0]u8,
     base_url: []const u8 = "https://ws.audioscrobbler.com/2.0/",
     base_url_login: []const u8 = "http://www.last.fm/api/auth/",
     http_client: *http.Client,
+    session: ?Session = null,
 
     /// Invoke a Last.fm method directly. This is used internally by the other
     /// methods in this struct, which you should use instead if possible.
-    pub fn invoke(self: LastFMClient, method: []const u8, params: QueryParameters, options: InvocationOptions, ally: std.mem.Allocator) !InvocationResult {
+    pub fn invoke(self: LastFMClient, method: []const u8, params: QueryParameters, options: InvocationOptions) !InvocationResult {
         if (options.logging) {
             std.debug.print("Invoking LastFM {s}\n", .{method});
         }
@@ -78,7 +90,7 @@ const LastFMClient = struct {
 
         // Optionally sign the request
         if (options.sign_request) {
-            const signature = try self.generateSignature(&params, ally);
+            const signature = try self.generateSignature(&params);
             try my_params.put("api_sig", &signature);
 
             if (options.logging) {
@@ -97,12 +109,12 @@ const LastFMClient = struct {
         switch(options.http_method) {
             .GET => {
                 // Build the URL
-                var url_builder = try paramsToQueryString(my_params, ally);
+                var url_builder = try paramsToQueryString(my_params, self.ally);
                 errdefer url_builder.deinit();
                 try url_builder.insert(0, '?');
                 try url_builder.insertSlice(0, self.base_url);
                 const url = try url_builder.toOwnedSlice();
-                defer ally.free(url);
+                defer self.ally.free(url);
                 if (options.logging) {
                     std.debug.print("  url = {s}\n", .{ url });
                 }
@@ -118,9 +130,9 @@ const LastFMClient = struct {
             },
             .POST => {
                 // Create payload
-                var payload_builder = try generatePostBody(&my_params, ally);
+                var payload_builder = try generatePostBody(&my_params, self.ally);
                 const payload = try payload_builder.toOwnedSlice();
-                defer ally.free(payload);
+                defer self.ally.free(payload);
 
                 // Fetch
                 response = try self.http_client.fetch(.{
@@ -147,9 +159,9 @@ const LastFMClient = struct {
 
     /// Generate an API signature given the query parameters.
     /// The result is pre-hashed with MD5.
-    pub fn generateSignature(self: LastFMClient, params: *const QueryParameters, ally: std.mem.Allocator) ![32]u8 {
+    pub fn generateSignature(self: LastFMClient, params: *const QueryParameters) ![32]u8 {
         // Get a list of all the keys
-        var sorted_keys_list = std.ArrayList([]const u8).init(ally);
+        var sorted_keys_list = std.ArrayList([]const u8).init(self.ally);
         errdefer sorted_keys_list.deinit();
 
         var iter = params.*.keyIterator();
@@ -161,11 +173,11 @@ const LastFMClient = struct {
 
         // Sort them
         const sorted_keys = try sorted_keys_list.toOwnedSlice();
-        defer ally.free(sorted_keys);
+        defer self.ally.free(sorted_keys);
         std.mem.sort([]const u8, sorted_keys, {}, stringCompare);
 
         // Start building the signature string
-        var sig = std.ArrayList(u8).init(ally);
+        var sig = std.ArrayList(u8).init(self.ally);
         errdefer sig.deinit();
         for (sorted_keys) |key| {
             // Get the value for the key
@@ -181,47 +193,47 @@ const LastFMClient = struct {
 
         // Return the MD5 hash of the signature string
         const sig_str = try sig.toOwnedSlice();
-        defer ally.free(sig_str);
+        defer self.ally.free(sig_str);
         std.debug.print("  raw sig = {s}\n", .{ sig_str });
         const md5_str = try md5(sig_str);
         return md5_str;
     }
 
     /// Get an authorization token to be exchanged for a session key.
-    pub fn getToken(self: LastFMClient, ally: std.mem.Allocator) ![32]u8 {
+    pub fn getToken(self: LastFMClient) ![32]u8 {
         // Call the API endpoint
-        var params = QueryParameters.init(ally);
+        var params = QueryParameters.init(self.ally);
         defer params.deinit();
 
-        var res_body = std.ArrayList(u8).init(ally);
+        var res_body = std.ArrayList(u8).init(self.ally);
         errdefer res_body.deinit();
         const res = try self.invoke("auth.getToken", params, .{
             .response_body = &res_body,
             .as_json = true,
-        }, ally);
+        });
         if (res.status != http.Status.ok) {
             return HttpError.NotOk;
         }
 
         // Extract token from response body
         const res_body_slice = try res_body.toOwnedSlice();
-        defer ally.free(res_body_slice);
+        defer self.ally.free(res_body_slice);
         const TokenResponse = struct { token: []const u8 };
-        const parsed = try std.json.parseFromSlice(TokenResponse, ally, res_body_slice, .{ .ignore_unknown_fields = true });
+        const parsed = try std.json.parseFromSlice(TokenResponse, self.ally, res_body_slice, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
 
         // Return the token
-        const token = try ally.dupe(u8, parsed.value.token);
-        defer ally.free(token);
+        const token = try self.ally.dupe(u8, parsed.value.token);
+        defer self.ally.free(token);
         return token[0..32].*;
     }
 
     /// Get a link for the user to visit in order to authorize the given token to be exchanged for a session.
     /// Make sure to free when finished!
-    pub fn getLoginUrl(self: LastFMClient, token: [32]u8, ally: std.mem.Allocator) ![]const u8 {
+    pub fn getLoginUrl(self: LastFMClient, token: [32]u8) ![]const u8 {
         // Build the login URL
         // TODO this should probably use a format string?
-        var url = std.ArrayList(u8).init(ally);
+        var url = std.ArrayList(u8).init(self.ally);
         errdefer url.deinit();
         try url.appendSlice(self.base_url_login);
         try url.appendSlice("?api_key=");
@@ -234,13 +246,14 @@ const LastFMClient = struct {
         return url_slice;
     }
 
-    pub fn getSession(self: LastFMClient, token: [32]u8, ally: std.mem.Allocator) !Session {
+    /// Exchange the given token for a session to use for authenticated calls. Feed this result into `useSession()`.
+    pub fn getSession(self: LastFMClient, token: [32]u8) !Session {
         // Call the API endpoint
-        var params = QueryParameters.init(ally);
+        var params = QueryParameters.init(self.ally);
         // defer params.deinit();
         try params.put("token", &token);
 
-        var res_body = std.ArrayList(u8).init(ally);
+        var res_body = std.ArrayList(u8).init(self.ally);
         errdefer res_body.deinit();
         const res = try self.invoke("auth.getSession", params, .{
             .response_body = &res_body,
@@ -248,11 +261,11 @@ const LastFMClient = struct {
             .logging = true,
             // .hash_token = true,
             .sign_request = true
-        }, ally);
+        });
 
         // Extract session from response body
         const res_body_slice = try res_body.toOwnedSlice();
-        defer ally.free(res_body_slice);
+        defer self.ally.free(res_body_slice);
 
         // Stop if the response errored
         std.debug.print("{s}\n", .{ res_body_slice });
@@ -264,13 +277,33 @@ const LastFMClient = struct {
             session: Session,
         };
 
-        const parsed: std.json.Parsed(SessionResponse) = try std.json.parseFromSlice(SessionResponse, ally, res_body_slice, .{ .ignore_unknown_fields = true });
+        const parsed: std.json.Parsed(SessionResponse) = try std.json.parseFromSlice(SessionResponse, self.ally, res_body_slice, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
 
         // Return the session object
         const session: Session = parsed.value.session;
         return session;
     }
+
+    /// Store the given session object. Any further authenticated calls will use this session.
+    pub fn useSession(self: *LastFMClient, session: Session) void {
+        self.session = session;
+    }
+
+    /// Returns `true` if there is an active session, `false` otherwise.
+    pub fn authenticated(self: *LastFMClient) bool {
+        return self.session != null;
+    }
+
+    // fn addScrobbleToParams(params: *QueryParameters, scrobble: Scrobble, index: ?usize) !void {
+    //     index = index orelse 0;
+        
+    // }
+
+    // /// Scrobble a single track. Returns `true` if successful, `false` otherwise.
+    // pub fn scrobble(self: *LastFMClient) bool {
+
+    // }
 };
 
 /// Utility function to hash a string using MD5, returned as a string.
@@ -379,19 +412,19 @@ test "invoke GET" {
     const lastfm_client = LastFMClient{
         .api_key = sensitive.API_KEY,
         .api_secret = sensitive.API_SECRET,
-        .http_client = &http_client
+        .http_client = &http_client,
+        .ally = ally
     };
     defer lastfm_client.http_client.*.deinit();
 
     // Attempt to invoke track.getInfo
     var params = QueryParameters.init(ally);
-    defer params.deinit();
     try params.put("track", "believe");
     try params.put("artist", "cher");
 
     var res_body = std.ArrayList(u8).init(ally);
     errdefer res_body.deinit();
-    const result = try lastfm_client.invoke("track.getInfo", params, .{ .logging = true, .response_body = &res_body }, ally);
+    const result = try lastfm_client.invoke("track.getInfo", params, .{ .logging = true, .response_body = &res_body });
     std.debug.print("Returned with status {d}\n", .{ result.status });
     try testing.expect(result.status == http.Status.ok);
 
@@ -412,12 +445,13 @@ test "get an authorization token" {
     const lastfm_client = LastFMClient{
         .api_key = sensitive.API_KEY,
         .api_secret = sensitive.API_SECRET,
-        .http_client = &http_client
+        .http_client = &http_client,
+        .ally = ally
     };
     defer lastfm_client.http_client.*.deinit();
 
     // Ask for a token
-    const token = try lastfm_client.getToken(ally);
+    const token = try lastfm_client.getToken();
     try testing.expect(token.len > 3);
     std.debug.print("Auth token: {s}\n", .{ token });
 }
@@ -433,23 +467,24 @@ test "get a session from an authorization token" {
     const lastfm_client = LastFMClient{
         .api_key = sensitive.API_KEY,
         .api_secret = sensitive.API_SECRET,
-        .http_client = &http_client
+        .http_client = &http_client,
+        .ally = ally
     };
     defer lastfm_client.http_client.*.deinit();
 
     // Ask for a token
-    const token = try lastfm_client.getToken(ally);
+    const token = try lastfm_client.getToken();
     std.debug.print("Token = {s}\n", .{token});
 
     // Prompt user to authorize the token
-    const login_url = try lastfm_client.getLoginUrl(token, ally);
+    const login_url = try lastfm_client.getLoginUrl(token);
     defer ally.free(login_url);
     std.debug.print("Please visit the following URL to allow this application to access your Last.fm account.\n{s}\n\nPress enter when you are finished.\n", .{ login_url });
     const stdin = std.io.getStdIn().reader();
     try stdin.skipUntilDelimiterOrEof('\n');
 
     // Try to exchange the token for a session
-    const session = try lastfm_client.getSession(token, ally);
+    const session = try lastfm_client.getSession(token);
     std.debug.print("Successfully logged in as {s} ({s}) with session key {s}\n", .{ session.name, if (session.subscribed()) "subscriber" else "basic", session.key });
 }
 
@@ -464,7 +499,8 @@ test "generate a valid API signature" {
     const lastfm_client = LastFMClient{
         .api_key = "a" ** 32,
         .api_secret = "a" ** 32,
-        .http_client = &http_client
+        .http_client = &http_client,
+        .ally = ally
     };
     defer lastfm_client.http_client.*.deinit();
 
@@ -476,7 +512,41 @@ test "generate a valid API signature" {
     try params.put("bb", "22");
 
     // Generate a signature
-    const generated_sig = try lastfm_client.generateSignature(&params, ally);
+    const generated_sig = try lastfm_client.generateSignature(&params);
     const expected_sig = try md5("a1bb22c3" ++ ("a" ** 32));
     try testing.expect(std.mem.eql(u8, &generated_sig, &expected_sig));
 }
+
+// test "scrobble a single track" {
+//     // Create a LastFMClient
+//     const ally = testing.allocator;
+
+//     var http_client = http.Client{
+//         .allocator = ally
+//     };
+    
+//     var lastfm_client = LastFMClient{
+//         .api_key = "a" ** 32,
+//         .api_secret = "a" ** 32,
+//         .http_client = &http_client,
+//         .ally = ally
+//     };
+//     defer lastfm_client.http_client.*.deinit();
+
+//     // Ask for a token
+//     const token = try lastfm_client.getToken();
+
+//     // Prompt user to authorize the token
+//     const login_url = try lastfm_client.getLoginUrl(token);
+//     defer ally.free(login_url);
+//     std.debug.print("Please visit the following URL to allow this application to access your Last.fm account.\n{s}\n\nPress enter when you are finished.\n", .{ login_url });
+//     const stdin = std.io.getStdIn().reader();
+//     try stdin.skipUntilDelimiterOrEof('\n');
+
+//     // Exchange the token for a session
+//     const session = try lastfm_client.getSession(token);
+//     lastfm_client.useSession(session);
+
+//     // Scrobble a dummy track
+    
+// }
